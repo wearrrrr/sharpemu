@@ -258,14 +258,14 @@ public static class KernelPthreadCompatExports
         ExportName = "scePthreadCondSignal",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int PthreadCondSignal(CpuContext ctx) => PthreadCondSignalCore(ctx[CpuRegister.Rdi], broadcast: false);
+    public static int PthreadCondSignal(CpuContext ctx) => PthreadCondSignalCore(ctx, ctx[CpuRegister.Rdi], broadcast: false);
 
     [SysAbiExport(
         Nid = "JGgj7Uvrl+A",
         ExportName = "scePthreadCondBroadcast",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int PthreadCondBroadcast(CpuContext ctx) => PthreadCondSignalCore(ctx[CpuRegister.Rdi], broadcast: true);
+    public static int PthreadCondBroadcast(CpuContext ctx) => PthreadCondSignalCore(ctx, ctx[CpuRegister.Rdi], broadcast: true);
 
     [SysAbiExport(
         Nid = "Op8TBGY5KHg",
@@ -279,7 +279,7 @@ public static class KernelPthreadCompatExports
         ExportName = "pthread_cond_broadcast",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int PosixPthreadCondBroadcast(CpuContext ctx) => PthreadCondSignalCore(ctx[CpuRegister.Rdi], broadcast: true);
+    public static int PosixPthreadCondBroadcast(CpuContext ctx) => PthreadCondSignalCore(ctx, ctx[CpuRegister.Rdi], broadcast: true);
 
     [SysAbiExport(
         Nid = "m5-2bsNfv7s",
@@ -901,14 +901,14 @@ public static class KernelPthreadCompatExports
         return waitResult;
     }
 
-    private static int PthreadCondSignalCore(ulong condAddress, bool broadcast)
+    private static int PthreadCondSignalCore(CpuContext ctx, ulong condAddress, bool broadcast)
     {
         if (condAddress == 0)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        if (!TryResolveCondState(null, condAddress, createIfZero: false, out _, out var state))
+        if (!TryResolveCondState(ctx, condAddress, createIfZero: true, out _, out var state))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }

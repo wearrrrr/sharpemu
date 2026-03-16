@@ -231,9 +231,6 @@ public sealed partial class DirectExecutionBackend
 			ProbeReturnRip(num7, num);
 			Console.Error.Flush();
 		}
-		ProbeReturnRip(0x0000000800EA020Eul, 999001);
-		ProbeReturnRip(0x0000000800EA0213ul, 999002);
-		ProbeReturnRip(0x0000000800EA040Aul, 999003);
 		try
 		{
 			OrbisGen2Result orbisGen2Result;
@@ -426,7 +423,20 @@ public sealed partial class DirectExecutionBackend
 			return false;
 		}
 		int num2 = CountDistinctImportLoopValuesFromTail(_importLoopReturnRips, sampleCount, 3);
-		return num2 <= 2;
+		if (num2 > 2)
+		{
+			return false;
+		}
+		int num3 = Math.Min(_importLoopSignatureCount, Math.Max(sampleCount * 8, ImportLoopWideDiversityWindow));
+		if (num3 <= sampleCount)
+		{
+			return true;
+		}
+		if (CountDistinctImportLoopValuesFromTail(_importLoopNidHashes, num3, 3) > 2)
+		{
+			return false;
+		}
+		return CountDistinctImportLoopValuesFromTail(_importLoopReturnRips, num3, 3) <= 2;
 	}
 
 	private int CountDistinctImportLoopValuesFromTail(ulong[] source, int sampleCount, int stopAfter)

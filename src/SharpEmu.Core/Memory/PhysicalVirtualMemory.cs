@@ -41,6 +41,9 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IDisposable
     private static extern bool VirtualProtect(void* lpAddress, nuint dwSize, uint flNewProtect, out uint lpflOldProtect);
 
     [DllImport("kernel32.dll")]
+    private static extern nuint VirtualQuery(void* lpAddress, out MemoryBasicInformation64 lpBuffer, nuint dwLength);
+
+    [DllImport("kernel32.dll")]
     private static extern void FlushInstructionCache(void* hProcess, void* lpBaseAddress, nuint dwSize);
 
     public bool TryAllocateAtExact(ulong desiredAddress, ulong size, bool executable, out ulong actualAddress)
@@ -351,6 +354,11 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IDisposable
                         return true;
                     }
 
+                    if (!EnsureRangeCommitted((ulong)srcPtr, (ulong)destination.Length, region))
+                    {
+                        return false;
+                    }
+
                     if (!TryTemporarilyProtectForRead((ulong)srcPtr, (ulong)destination.Length, region, out var touchedPages))
                     {
                         return false;
@@ -387,6 +395,11 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IDisposable
                     if (source.IsEmpty)
                     {
                         return true;
+                    }
+
+                    if (!EnsureRangeCommitted((ulong)destPtr, (ulong)source.Length, region))
+                    {
+                        return false;
                     }
 
                     if (!VirtualProtect(destPtr, (nuint)source.Length, PAGE_EXECUTE_READWRITE, out var oldProtect))
@@ -494,6 +507,48 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IDisposable
         return protection is PAGE_EXECUTE or PAGE_EXECUTE_READ or PAGE_EXECUTE_READWRITE or PAGE_EXECUTE_WRITECOPY;
     }
 
+    private static uint GetCommitProtection(MemoryRegion region)
+    {
+        return region.IsExecutable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+    }
+
+    private static unsafe bool EnsureRangeCommitted(ulong address, ulong size, MemoryRegion region)
+    {
+        if (size == 0 || !region.IsReservedOnly)
+        {
+            return true;
+        }
+
+        var startPage = AlignDown(address, PageSize);
+        var endPage = AlignUp(address + size, PageSize);
+        var commitProtection = GetCommitProtection(region);
+
+        for (var pageAddress = startPage; pageAddress < endPage; pageAddress += PageSize)
+        {
+            if (VirtualQuery((void*)pageAddress, out var info, (nuint)sizeof(MemoryBasicInformation64)) == 0)
+            {
+                return false;
+            }
+
+            if (info.State == MEM_COMMIT)
+            {
+                continue;
+            }
+
+            if (info.State != MEM_RESERVE)
+            {
+                return false;
+            }
+
+            if (VirtualAlloc((void*)pageAddress, (nuint)PageSize, MEM_COMMIT, commitProtection) == null)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private bool TryTemporarilyProtectForRead(
         ulong address,
         ulong size,
@@ -557,5 +612,18 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IDisposable
         public bool IsExecutable { get; set; }
         public bool IsReservedOnly { get; set; }
         public uint Protection { get; set; }
+    }
+
+    private struct MemoryBasicInformation64
+    {
+        public ulong BaseAddress;
+        public ulong AllocationBase;
+        public uint AllocationProtect;
+        public uint Alignment1;
+        public ulong RegionSize;
+        public uint State;
+        public uint Protect;
+        public uint Type;
+        public uint Alignment2;
     }
 }

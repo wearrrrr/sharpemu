@@ -13,6 +13,10 @@ namespace SharpEmu.Core.Cpu.Native;
 
 public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, IDisposable
 {
+	private const int ImportLoopHistoryLength = 2048;
+
+	private const int ImportLoopWideDiversityWindow = 768;
+
 	private readonly struct ImportStubEntry
 	{
 		public ulong Address { get; }
@@ -89,7 +93,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private const uint PAGE_EXECUTE_READ = 32u;
 
-	private const int TlsHandlerRegionSize = 4096;
+	private const int TlsHandlerRegionSize = 16384;
 
 	private const ulong TlsModuleAllocStart = 140726751354880uL;
 
@@ -179,11 +183,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private ulong _entryReturnSentinelRip;
 
-	private readonly ulong[] _importLoopSignatures = new ulong[192];
+	private readonly ulong[] _importLoopSignatures = new ulong[ImportLoopHistoryLength];
 
-	private readonly ulong[] _importLoopNidHashes = new ulong[192];
+	private readonly ulong[] _importLoopNidHashes = new ulong[ImportLoopHistoryLength];
 
-	private readonly ulong[] _importLoopReturnRips = new ulong[192];
+	private readonly ulong[] _importLoopReturnRips = new ulong[ImportLoopHistoryLength];
 
 	private int _importLoopSignatureCount;
 
@@ -601,14 +605,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	{
 		return exportName switch
 		{
-			"_init_env" or
-			"atexit" or
-			"strlen" or
-			"strnlen" or
-			"strcmp" or
-			"strncmp" or
-			"strcpy" or
-			"strncpy" or
 			"memcpy" or
 			"memmove" or
 			"memset" or
