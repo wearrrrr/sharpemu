@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.Libs.Kernel;
 using SharpEmu.Libs.VideoOut;
 using System.Buffers.Binary;
-using System.Threading;
+using System.Runtime.CompilerServices;
 
 namespace SharpEmu.Libs.Agc;
 
@@ -16,7 +17,9 @@ public static class AgcExports
     private const uint ItIndexBufferSize = 0x13;
     private const uint ItIndexBase = 0x26;
     private const uint ItIndexType = 0x2A;
+    private const uint ItNumInstances = 0x2F;
     private const uint ItDrawIndexOffset2 = 0x35;
+    private const uint ItEventWrite = 0x46;
     private const uint ItSetShReg = 0x76;
     private const uint RZero = 0x00;
     private const uint RDrawIndexAuto = 0x04;
@@ -25,11 +28,16 @@ public static class AgcExports
     private const uint RShRegsIndirect = 0x11;
     private const uint RCxRegsIndirect = 0x12;
     private const uint RUcRegsIndirect = 0x13;
+    private const uint RAcquireMem = 0x14;
     private const uint RFlip = 0x17;
     private const uint SpiShaderPgmLoPs = 0x8;
     private const uint SpiShaderPgmHiPs = 0x9;
     private const uint SpiShaderPgmLoEs = 0xC8;
     private const uint SpiShaderPgmHiEs = 0xC9;
+    private const uint SpiPsInputEna = 0x1B3;
+    private const uint SpiPsInputAddr = 0x1B4;
+    private const uint ComputePgmLo = 0x20C;
+    private const uint ComputePgmHi = 0x20D;
     private const uint SpiPsInputCntl0 = 0x191;
     private const uint VgtPrimitiveType = 0x242;
     private const uint PsTextureUserDataRegister = 0xC;
@@ -37,6 +45,10 @@ public static class AgcExports
     private const uint Gen5TextureType2D = 9;
     private const ulong VideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
     private const ulong VideoOutPixelFormatA8B8G8R8Srgb = 0x80002200;
+    private const uint RegisterDefaultsVersion7 = 7;
+    private const uint RegisterDefaultsVersion8 = 8;
+    private const int RegisterDefaultsSize = 0x40;
+    private const int RegisterDefaultBlockSize = 16 * 8;
 
     private const ulong ShaderUserDataOffset = 0x08;
     private const ulong ShaderCodeOffset = 0x10;
@@ -58,9 +70,86 @@ public static class AgcExports
     private const ulong ShaderSpecialVgtGsOutPrimTypeOffset = 0x20;
     private const ulong ShaderSpecialGeUserVgprEnOffset = 0x28;
     private const uint CbSetShRegisterRangeMarker = 0x6875000D;
+    private static readonly object _submitTraceGate = new();
+    private static readonly HashSet<uint> _tracedDcbSizes = new();
+    private static readonly HashSet<(ulong Es, ulong Ps, GuestDrawKind Kind)> _tracedShaderTranslations = new();
     private static readonly object _softwarePresenterGate = new();
     private static readonly Dictionary<(ulong Source, ulong Destination), ulong> _softwarePresenterFingerprints = new();
-    private static int _submitTraceCaptured;
+    private static readonly object _registerDefaultsGate = new();
+    private static readonly ConditionalWeakTable<object, RegisterDefaultsAllocation> _registerDefaultsAllocations = new();
+
+    private static readonly RegisterDefaultGroup[] PrimaryRegisterDefaults =
+    [
+        new(0, 3, 0x0BC65DA4, [new(0x08F, 0)]),
+        new(0, 4, 0x9E5AD592, [new(0x08E, 0)]),
+        new(0, 12, 0x6DE4C312, [new(0x203, 0)]),
+        new(0, 72, 0x38E92C91,
+        [
+            new(0x318, 0),
+            new(0x31B, 0),
+            new(0x31C, 0),
+            new(0x31D, 0),
+            new(0x31E, 0x48),
+            new(0x31F, 0),
+            new(0x321, 0),
+            new(0x323, 0),
+            new(0x324, 0),
+            new(0x325, 0),
+            new(0x390, 0),
+            new(0x398, 0),
+            new(0x3A0, 0),
+            new(0x3A8, 0),
+            new(0x3B0, 0),
+            new(0x3B8, 0x0006C000),
+        ]),
+        new(0, 73, 0x0B177B43, [new(0x00C, 0), new(0x00D, 0x40004000)]),
+        new(0, 74, 0x48531062, [new(0x191, 0)]),
+        new(0, 76, 0x7690AF6F,
+        [
+            new(0x10F, 0x4E7E0000),
+            new(0x111, 0x4E7E0000),
+            new(0x113, 0x4E7E0000),
+            new(0x110, 0),
+            new(0x112, 0),
+            new(0x114, 0),
+            new(0x094, 0x80000000),
+            new(0x095, 0x40004000),
+            new(0x0B4, 0),
+            new(0x0B5, 0),
+        ]),
+        new(1, 13, 0xC918DF3E, [new(0x20C, 0), new(0x20D, 0)]),
+        new(1, 14, 0xC9751C9C, [new(0x0C8, 0), new(0x0C9, 0)]),
+        new(1, 18, 0xC9E01B31, [new(0x008, 0), new(0x009, 0)]),
+        new(2, 3, 0x105971C2, [new(0x25B, 0)]),
+        new(2, 7, 0x40D49AD1, [new(0x262, 0)]),
+        new(2, 12, 0x9EBFAB10, [new(0x242, 0)]),
+    ];
+
+    private static readonly RegisterDefaultGroup[] InternalRegisterDefaults =
+    [
+        new(0, 0, 0x8FB4EDB5, [new(0x00E, 0)]),
+        new(0, 1, 0xB994AD29, [new(0x2AF, 0)]),
+        new(0, 2, 0xD427322F, [new(0x314, 0)]),
+        new(0, 3, 0xF58FEA31, [new(0x1B5, 0)]),
+        new(1, 0, 0x6AC156EF, [new(0x216, 0)]),
+        new(1, 1, 0x6AC15610, [new(0x217, 0)]),
+        new(1, 2, 0x6AC15009, [new(0x219, 0)]),
+        new(1, 3, 0x6AC153BA, [new(0x21A, 0)]),
+        new(1, 4, 0xBE7DCD73, [new(0x27D, 0)]),
+        new(1, 5, 0x0C4B1438, [new(0x22A, 0)]),
+        new(1, 6, 0xDB00D71A, [new(0x204, 0)]),
+        new(1, 7, 0xDB00D249, [new(0x205, 0)]),
+        new(1, 8, 0xDB00EC60, [new(0x206, 0)]),
+        new(1, 9, 0x0C4D6FE4, [new(0x080, 0)]),
+        new(1, 10, 0x0C4A80EF, [new(0x100, 0)]),
+        new(1, 11, 0x0DD283E7, [new(0x006, 0)]),
+        new(1, 12, 0xC620E68C, [new(0x081, 0)]),
+        new(1, 13, 0xC67EFACF, [new(0x101, 0)]),
+        new(1, 14, 0xD9E6D9F7, [new(0x001, 0)]),
+        new(2, 0, 0x31F34B9F, [new(0x24F, 0)]),
+        new(2, 1, 0xAC0F9E76, [new(0x80003FFF, 0)]),
+        new(2, 2, 0x929FD95D, [new(0x250, 0)]),
+    ];
 
     private readonly record struct TextureDescriptor(
         ulong Address,
@@ -69,6 +158,57 @@ public static class AgcExports
         uint Format,
         uint TileMode,
         uint Type);
+
+    private sealed class SubmittedDcbState
+    {
+        public Dictionary<uint, uint> CxRegisters { get; } = new();
+        public Dictionary<uint, uint> ShRegisters { get; } = new();
+        public Dictionary<uint, uint> UcRegisters { get; } = new();
+    }
+
+    private readonly record struct RegisterDefaultValue(uint Offset, uint Value);
+
+    private readonly record struct RegisterDefaultGroup(
+        uint Space,
+        uint Index,
+        uint Type,
+        RegisterDefaultValue[] Registers);
+
+    private sealed record RegisterDefaultsAllocation(ulong Primary, ulong Internal);
+
+    [SysAbiExport(
+        Nid = "23LRUSvYu1M",
+        ExportName = "sceAgcInit",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int Init(CpuContext ctx)
+    {
+        var stateAddress = ctx[CpuRegister.Rdi];
+        var version = (uint)ctx[CpuRegister.Rsi];
+        if (stateAddress == 0 || !IsSupportedRegisterDefaultsVersion(version))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        TraceAgc($"agc.init state=0x{stateAddress:X16} version={version}");
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "2JtWUUiYBXs",
+        ExportName = "sceAgcGetRegisterDefaults2",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int GetRegisterDefaults2(CpuContext ctx) =>
+        ReturnRegisterDefaults(ctx, internalDefaults: false);
+
+    [SysAbiExport(
+        Nid = "wRbq6ZjNop4",
+        ExportName = "sceAgcGetRegisterDefaults2Internal",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int GetRegisterDefaults2Internal(CpuContext ctx) =>
+        ReturnRegisterDefaults(ctx, internalDefaults: true);
 
     [SysAbiExport(
         Nid = "f3dg2CSgRKY",
@@ -80,7 +220,7 @@ public static class AgcExports
         var destinationAddress = ctx[CpuRegister.Rdi];
         var headerAddress = ctx[CpuRegister.Rsi];
         var codeAddress = ctx[CpuRegister.Rdx];
-        if (destinationAddress == 0 || headerAddress == 0 || codeAddress == 0)
+        if (headerAddress == 0 || codeAddress == 0)
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
@@ -128,7 +268,8 @@ public static class AgcExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        if (!ctx.TryWriteUInt64(destinationAddress, headerAddress))
+        if (destinationAddress != 0 &&
+            !ctx.TryWriteUInt64(destinationAddress, headerAddress))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
@@ -431,6 +572,136 @@ public static class AgcExports
     }
 
     [SysAbiExport(
+        Nid = "tSBxhAPyytQ",
+        ExportName = "sceAgcDcbSetNumInstances",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbSetNumInstances(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var instanceCount = (uint)ctx[CpuRegister.Rsi];
+        if (commandBufferAddress == 0)
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 2, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(2, ItNumInstances, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, instanceCount))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        TraceAgc($"agc.dcb_set_num_instances buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} count={instanceCount}");
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    [SysAbiExport(
+        Nid = "Yw0jKSqop+E",
+        ExportName = "sceAgcDcbDrawIndexAuto",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbDrawIndexAuto(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var indexCount = (uint)ctx[CpuRegister.Rsi];
+        var modifier = ctx[CpuRegister.Rdx];
+        if (commandBufferAddress == 0 || modifier != 0x4000_0000)
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 7, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(7, ItNop, RDrawIndexAuto)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, indexCount) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, 0) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, 0) ||
+            !TryWriteUInt32(ctx, commandAddress + 16, 0) ||
+            !TryWriteUInt32(ctx, commandAddress + 20, 0) ||
+            !TryWriteUInt32(ctx, commandAddress + 24, 0))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        TraceAgc($"agc.dcb_draw_index_auto buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} count={indexCount}");
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    [SysAbiExport(
+        Nid = "aJf+j5yntiU",
+        ExportName = "sceAgcDcbEventWrite",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbEventWrite(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var eventType = (uint)(ctx[CpuRegister.Rsi] & 0xFF);
+        var eventAddress = ctx[CpuRegister.Rdx];
+        if (commandBufferAddress == 0 || eventType > 0x3F || eventAddress != 0)
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 2, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(2, ItEventWrite, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, eventType))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        TraceAgc($"agc.dcb_event_write buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} type={eventType}");
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    [SysAbiExport(
+        Nid = "57labkp+rSQ",
+        ExportName = "sceAgcDcbAcquireMem",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbAcquireMem(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var engine = (uint)(ctx[CpuRegister.Rsi] & 0xFF);
+        var cbDbOp = (uint)ctx[CpuRegister.Rdx];
+        var gcrControl = (uint)ctx[CpuRegister.Rcx];
+        var baseAddress = ctx[CpuRegister.R8];
+        var sizeBytes = ctx[CpuRegister.R9];
+        if (!TryReadUInt32(ctx, ctx[CpuRegister.Rsp] + sizeof(ulong), out var pollCycles))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        var noSize = sizeBytes == ulong.MaxValue;
+        if (commandBufferAddress == 0 ||
+            engine > 1 ||
+            (!noSize && (sizeBytes & 0xFF) != 0) ||
+            (!noSize && (sizeBytes >> 40) != 0) ||
+            (baseAddress & 0xFF) != 0 ||
+            (baseAddress >> 40) != 0)
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 8, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(8, ItNop, RAcquireMem)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, (engine << 31) | cbDbOp) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, noSize ? 0 : (uint)(sizeBytes >> 8)) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, 0) ||
+            !TryWriteUInt32(ctx, commandAddress + 16, (uint)(baseAddress >> 8)) ||
+            !TryWriteUInt32(ctx, commandAddress + 20, 0) ||
+            !TryWriteUInt32(ctx, commandAddress + 24, pollCycles / 40) ||
+            !TryWriteUInt32(ctx, commandAddress + 28, gcrControl))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        TraceAgc(
+            $"agc.dcb_acquire_mem buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} " +
+            $"engine={engine} cbdb=0x{cbDbOp:X8} gcr=0x{gcrControl:X8} base=0x{baseAddress:X16} size=0x{sizeBytes:X16}");
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    [SysAbiExport(
         Nid = "l4fM9K-Lyks",
         ExportName = "sceAgcDcbSetIndexBuffer",
         Target = Generation.Gen5,
@@ -567,10 +838,20 @@ public static class AgcExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        TraceAgc($"agc.driver_submit_dcb packet=0x{packetAddress:X16} addr=0x{commandAddress:X16} dwords={dwordCount}");
-        var tracePackets =
-            string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"), "1", StringComparison.Ordinal) &&
-            Interlocked.CompareExchange(ref _submitTraceCaptured, 1, 0) == 0;
+        var tracePackets = false;
+        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"), "1", StringComparison.Ordinal))
+        {
+            lock (_submitTraceGate)
+            {
+                tracePackets = _tracedDcbSizes.Add(dwordCount);
+            }
+        }
+
+        if (tracePackets)
+        {
+            TraceAgc($"agc.driver_submit_dcb packet=0x{packetAddress:X16} addr=0x{commandAddress:X16} dwords={dwordCount}");
+        }
+
         ParseSubmittedDcb(ctx, commandAddress, dwordCount, tracePackets);
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -596,6 +877,8 @@ public static class AgcExports
         }
 
         TextureDescriptor? presenterTexture = null;
+        GuestDrawKind guestDrawKind = GuestDrawKind.None;
+        var state = new SubmittedDcbState();
         var sawIndexedDraw = false;
         var offset = 0u;
         while (offset < dwordCount)
@@ -625,12 +908,25 @@ public static class AgcExports
                 presenterTexture = texture;
             }
 
+            ApplySubmittedRegisters(ctx, state, currentAddress, length, op, register);
+
             if (op == ItDrawIndexOffset2 &&
                 length >= 5 &&
                 TryReadUInt32(ctx, currentAddress + 4, out var indexCount) &&
                 indexCount != 0)
             {
                 sawIndexedDraw = true;
+                TryTranslateGuestDraw(ctx, state, indexCount, ref guestDrawKind);
+            }
+
+            if (op == ItNop &&
+                register == RDrawIndexAuto &&
+                length >= 2 &&
+                TryReadUInt32(ctx, currentAddress + 4, out var autoIndexCount) &&
+                autoIndexCount != 0)
+            {
+                sawIndexedDraw = true;
+                TryTranslateGuestDraw(ctx, state, autoIndexCount, ref guestDrawKind);
             }
 
             if (op == ItNop && register == RFlip && length >= 6)
@@ -654,12 +950,138 @@ public static class AgcExports
                         unchecked((int)videoOutHandle),
                         displayBufferIndex);
                 }
+                else if (sawIndexedDraw &&
+                         guestDrawKind != GuestDrawKind.None &&
+                         VideoOutExports.TryGetDisplayBufferInfo(
+                             unchecked((int)videoOutHandle),
+                             displayBufferIndex,
+                             out var displayBuffer))
+                {
+                    VulkanVideoPresenter.SubmitGuestDraw(
+                        guestDrawKind,
+                        displayBuffer.Width,
+                        displayBuffer.Height);
+                }
 
                 _ = VideoOutExports.SubmitFlipFromAgc(ctx, unchecked((int)videoOutHandle), displayBufferIndex, unchecked((int)flipMode), flipArg);
             }
 
             offset += length;
         }
+    }
+
+    private static void ApplySubmittedRegisters(
+        CpuContext ctx,
+        SubmittedDcbState state,
+        ulong packetAddress,
+        uint packetLength,
+        uint op,
+        uint register)
+    {
+        if (op == ItSetShReg)
+        {
+            if (packetLength < 3 ||
+                !TryReadUInt32(ctx, packetAddress + sizeof(uint), out var startRegister))
+            {
+                return;
+            }
+
+            for (uint index = 0; index < packetLength - 2; index++)
+            {
+                if (!TryReadUInt32(
+                        ctx,
+                        packetAddress + 8 + ((ulong)index * sizeof(uint)),
+                        out var value))
+                {
+                    return;
+                }
+
+                state.ShRegisters[startRegister + index] = value;
+            }
+
+            return;
+        }
+
+        if (op != ItNop ||
+            register is not (RCxRegsIndirect or RShRegsIndirect or RUcRegsIndirect) ||
+            packetLength < 4 ||
+            !TryReadUInt32(ctx, packetAddress + sizeof(uint), out var registerCount) ||
+            !TryReadUInt64(ctx, packetAddress + 8, out var registersAddress))
+        {
+            return;
+        }
+
+        var destination = register switch
+        {
+            RCxRegsIndirect => state.CxRegisters,
+            RShRegsIndirect => state.ShRegisters,
+            _ => state.UcRegisters,
+        };
+        for (uint index = 0; index < registerCount; index++)
+        {
+            var entryAddress = registersAddress + ((ulong)index * 8);
+            if (!TryReadUInt32(ctx, entryAddress, out var registerOffset) ||
+                !TryReadUInt32(ctx, entryAddress + sizeof(uint), out var value))
+            {
+                return;
+            }
+
+            if (registerOffset != 0)
+            {
+                destination[registerOffset] = value;
+            }
+        }
+    }
+
+    private static void TryTranslateGuestDraw(
+        CpuContext ctx,
+        SubmittedDcbState state,
+        uint vertexCount,
+        ref GuestDrawKind drawKind)
+    {
+        if (drawKind != GuestDrawKind.None ||
+            vertexCount != 3 ||
+            !TryGetShaderAddress(state.ShRegisters, SpiShaderPgmLoEs, SpiShaderPgmHiEs, out var exportShaderAddress) ||
+            !TryGetShaderAddress(state.ShRegisters, SpiShaderPgmLoPs, SpiShaderPgmHiPs, out var pixelShaderAddress) ||
+            !state.CxRegisters.TryGetValue(SpiPsInputEna, out var psInputEna) ||
+            !state.CxRegisters.TryGetValue(SpiPsInputAddr, out var psInputAddr) ||
+            !Gen5ShaderTranslator.TryTranslate(
+                ctx,
+                exportShaderAddress,
+                pixelShaderAddress,
+                psInputEna,
+                psInputAddr,
+                out drawKind))
+        {
+            return;
+        }
+
+        lock (_submitTraceGate)
+        {
+            if (_tracedShaderTranslations.Add((exportShaderAddress, pixelShaderAddress, drawKind)))
+            {
+                TraceAgc(
+                    $"agc.shader_translated kind={drawKind} es=0x{exportShaderAddress:X16} " +
+                    $"ps=0x{pixelShaderAddress:X16} vertices={vertexCount}");
+            }
+        }
+    }
+
+    private static bool TryGetShaderAddress(
+        IReadOnlyDictionary<uint, uint> registers,
+        uint loRegister,
+        uint hiRegister,
+        out ulong address)
+    {
+        address = 0;
+        if (!registers.TryGetValue(loRegister, out var lo) ||
+            !registers.TryGetValue(hiRegister, out var hi))
+        {
+            return false;
+        }
+
+        address = ((ulong)hi << 40) | ((ulong)lo << 8);
+        return address != 0;
     }
 
     private static bool TryReadTextureDescriptor(
@@ -802,6 +1224,7 @@ public static class AgcExports
             _softwarePresenterFingerprints[fingerprintKey] = fingerprint;
         }
 
+        VideoOutExports.SubmitHostRgbaFrame(sourceBytes, source.Width, source.Height);
         TraceAgc(
             $"agc.software_presenter src=0x{source.Address:X16} {source.Width}x{source.Height} fmt={source.Format} " +
             $"dst=0x{destination.Address:X16} {destination.Width}x{destination.Height} fingerprint=0x{fingerprint:X16}");
@@ -895,8 +1318,20 @@ public static class AgcExports
             return false;
         }
 
-        var expectedLo = shaderType == 2 ? SpiShaderPgmLoEs : shaderType == 1 ? SpiShaderPgmLoPs : 0;
-        var expectedHi = shaderType == 2 ? SpiShaderPgmHiEs : shaderType == 1 ? SpiShaderPgmHiPs : 0;
+        var expectedLo = shaderType switch
+        {
+            0 => ComputePgmLo,
+            1 => SpiShaderPgmLoPs,
+            2 => SpiShaderPgmLoEs,
+            _ => 0u,
+        };
+        var expectedHi = shaderType switch
+        {
+            0 => ComputePgmHi,
+            1 => SpiShaderPgmHiPs,
+            2 => SpiShaderPgmHiEs,
+            _ => 0u,
+        };
         if (expectedLo == 0 || loRegister != expectedLo || hiRegister != expectedHi)
         {
             TraceCreateShader(0, headerAddress, codeAddress, $"unexpected-registers type={shaderType} lo=0x{loRegister:X8} hi=0x{hiRegister:X8}");
@@ -1030,6 +1465,150 @@ public static class AgcExports
 
         return ctx.TryWriteUInt64(fieldAddress, fieldAddress + relativeAddress);
     }
+
+    private static int ReturnRegisterDefaults(CpuContext ctx, bool internalDefaults)
+    {
+        var version = (uint)ctx[CpuRegister.Rdi];
+        if (!IsSupportedRegisterDefaultsVersion(version))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        if (!TryGetRegisterDefaultsAllocation(ctx, out var allocation))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        var address = internalDefaults ? allocation.Internal : allocation.Primary;
+        TraceAgc($"agc.get_register_defaults internal={internalDefaults} version={version} address=0x{address:X16}");
+        return ReturnPointer(ctx, address);
+    }
+
+    private static bool IsSupportedRegisterDefaultsVersion(uint version)
+    {
+        return version is RegisterDefaultsVersion7 or RegisterDefaultsVersion8;
+    }
+
+    private static bool TryGetRegisterDefaultsAllocation(
+        CpuContext ctx,
+        out RegisterDefaultsAllocation allocation)
+    {
+        lock (_registerDefaultsGate)
+        {
+            if (_registerDefaultsAllocations.TryGetValue(ctx.Memory, out allocation!))
+            {
+                return true;
+            }
+
+            if (!TryBuildRegisterDefaults(
+                    ctx,
+                    PrimaryRegisterDefaults,
+                    cxTableLength: 78,
+                    shTableLength: 29,
+                    ucTableLength: 20,
+                    out var primaryAddress) ||
+                !TryBuildRegisterDefaults(
+                    ctx,
+                    InternalRegisterDefaults,
+                    cxTableLength: 4,
+                    shTableLength: 15,
+                    ucTableLength: 3,
+                    out var internalAddress))
+            {
+                allocation = null!;
+                return false;
+            }
+
+            allocation = new RegisterDefaultsAllocation(primaryAddress, internalAddress);
+            _registerDefaultsAllocations.Add(ctx.Memory, allocation);
+            return true;
+        }
+    }
+
+    private static bool TryBuildRegisterDefaults(
+        CpuContext ctx,
+        RegisterDefaultGroup[] groups,
+        int cxTableLength,
+        int shTableLength,
+        int ucTableLength,
+        out ulong address)
+    {
+        var cxTableOffset = AlignUp(RegisterDefaultsSize, sizeof(ulong));
+        var shTableOffset = cxTableOffset + (cxTableLength * sizeof(ulong));
+        var ucTableOffset = shTableOffset + (shTableLength * sizeof(ulong));
+        var typesOffset = AlignUp(ucTableOffset + (ucTableLength * sizeof(ulong)), sizeof(uint));
+        var registerBlocksOffset = AlignUp(typesOffset + (groups.Length * 3 * sizeof(uint)), sizeof(ulong));
+        var blobLength = registerBlocksOffset + (groups.Length * RegisterDefaultBlockSize);
+
+        if (!KernelMemoryCompatExports.TryAllocateHleData(ctx, (ulong)blobLength, 0x1000, out address))
+        {
+            return false;
+        }
+
+        var blob = new byte[blobLength];
+        WriteBlobUInt64(blob, 0x00, address + (ulong)cxTableOffset);
+        WriteBlobUInt64(blob, 0x08, address + (ulong)shTableOffset);
+        WriteBlobUInt64(blob, 0x10, address + (ulong)ucTableOffset);
+        WriteBlobUInt64(blob, 0x30, address + (ulong)typesOffset);
+        WriteBlobUInt32(blob, 0x38, (uint)groups.Length);
+
+        for (var groupIndex = 0; groupIndex < groups.Length; groupIndex++)
+        {
+            var group = groups[groupIndex];
+            if (group.Registers.Length > 16)
+            {
+                return false;
+            }
+
+            var tableOffset = group.Space switch
+            {
+                0 => cxTableOffset,
+                1 => shTableOffset,
+                2 => ucTableOffset,
+                _ => -1,
+            };
+            var tableLength = group.Space switch
+            {
+                0 => cxTableLength,
+                1 => shTableLength,
+                2 => ucTableLength,
+                _ => 0,
+            };
+            if (tableOffset < 0 || group.Index >= tableLength)
+            {
+                return false;
+            }
+
+            var registerBlockOffset = registerBlocksOffset + (groupIndex * RegisterDefaultBlockSize);
+            WriteBlobUInt64(
+                blob,
+                tableOffset + ((int)group.Index * sizeof(ulong)),
+                address + (ulong)registerBlockOffset);
+
+            var typeEntryOffset = typesOffset + (groupIndex * 3 * sizeof(uint));
+            WriteBlobUInt32(blob, typeEntryOffset, group.Type);
+            WriteBlobUInt32(blob, typeEntryOffset + sizeof(uint), (group.Index * 4) + group.Space);
+
+            for (var registerIndex = 0; registerIndex < group.Registers.Length; registerIndex++)
+            {
+                var register = group.Registers[registerIndex];
+                var registerOffset = registerBlockOffset + (registerIndex * 2 * sizeof(uint));
+                WriteBlobUInt32(blob, registerOffset, register.Offset);
+                WriteBlobUInt32(blob, registerOffset + sizeof(uint), register.Value);
+            }
+        }
+
+        return ctx.Memory.TryWrite(address, blob);
+    }
+
+    private static int AlignUp(int value, int alignment) =>
+        (value + alignment - 1) & -alignment;
+
+    private static void WriteBlobUInt32(Span<byte> blob, int offset, uint value) =>
+        BinaryPrimitives.WriteUInt32LittleEndian(blob[offset..], value);
+
+    private static void WriteBlobUInt64(Span<byte> blob, int offset, ulong value) =>
+        BinaryPrimitives.WriteUInt64LittleEndian(blob[offset..], value);
 
     private static int ReturnPointer(CpuContext ctx, ulong pointer)
     {

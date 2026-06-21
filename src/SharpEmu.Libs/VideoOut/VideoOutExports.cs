@@ -44,6 +44,36 @@ public static class VideoOutExports
     private static int _nextHandle = 1;
     private static int _frameDumpCount;
     private static long _nextFrameDumpIndex;
+    private static string _windowTitle = "SharpEmu VideoOut";
+
+    public static void ConfigureApplicationInfo(string? title, string? titleId, string? version)
+    {
+        var parts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(title))
+        {
+            parts.Add(title.Trim());
+        }
+
+        if (!string.IsNullOrWhiteSpace(titleId))
+        {
+            parts.Add($"[{titleId.Trim()}]");
+        }
+
+        var application = parts.Count == 0 ? "VideoOut" : string.Join(' ', parts);
+        var versionSuffix = string.IsNullOrWhiteSpace(version) ? string.Empty : $" v{version.Trim()}";
+        lock (_stateGate)
+        {
+            _windowTitle = $"SharpEmu - {application}{versionSuffix}";
+        }
+    }
+
+    internal static string GetWindowTitle()
+    {
+        lock (_stateGate)
+        {
+            return _windowTitle;
+        }
+    }
 
     private sealed class VideoOutPortState
     {
@@ -210,7 +240,15 @@ public static class VideoOutExports
 
         lock (_stateGate)
         {
-            port.FlipEvents.Add(new FlipEventRegistration(equeue, userData));
+            var existingIndex = port.FlipEvents.FindIndex(registration => registration.Equeue == equeue);
+            if (existingIndex >= 0)
+            {
+                port.FlipEvents[existingIndex] = new FlipEventRegistration(equeue, userData);
+            }
+            else
+            {
+                port.FlipEvents.Add(new FlipEventRegistration(equeue, userData));
+            }
         }
 
         TraceVideoOut($"videoout.add_flip_event eq=0x{equeue:X16} handle={handle} udata=0x{userData:X16}");
@@ -284,7 +322,8 @@ public static class VideoOutExports
             return OrbisVideoOutErrorInvalidEvent;
         }
 
-        return ctx.TryWriteUInt64(dataAddress, data >> 16)
+        var decodedData = unchecked((ulong)(unchecked((long)data) >> 16));
+        return ctx.TryWriteUInt64(dataAddress, decodedData)
             ? (int)OrbisGen2Result.ORBIS_GEN2_OK
             : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
     }
@@ -610,7 +649,7 @@ public static class VideoOutExports
             return OrbisVideoOutErrorInvalidIndex;
         }
 
-        ulong eventData;
+        ulong eventHint;
         List<FlipEventRegistration> flipEvents;
         lock (_stateGate)
         {
@@ -621,9 +660,8 @@ public static class VideoOutExports
 
             port.CurrentBuffer = bufferIndex;
             port.FlipCount++;
-            var eventCount = Math.Min(port.FlipCount, 0xFUL);
-            var timeBits = (ulong)Environment.TickCount64 & 0xFFFUL;
-            eventData = timeBits | (eventCount << 12) | ((unchecked((ulong)flipArg) & 0x0000_FFFF_FFFF_FFFFUL) << 16);
+            eventHint = SceVideoOutInternalEventFlip |
+                ((unchecked((ulong)flipArg) & 0x0000_FFFF_FFFF_FFFFUL) << 16);
             flipEvents = new List<FlipEventRegistration>(port.FlipEvents);
         }
 
@@ -637,15 +675,12 @@ public static class VideoOutExports
 
         foreach (var flipEvent in flipEvents)
         {
-            _ = KernelEventQueueCompatExports.EnqueueEvent(
+            _ = KernelEventQueueCompatExports.TriggerDisplayEvent(
                 flipEvent.Equeue,
-                new KernelEventQueueCompatExports.KernelQueuedEvent(
-                    SceVideoOutInternalEventFlip,
-                    OrbisKernelEventFilterVideoOut,
-                    0,
-                    0,
-                    eventData,
-                    flipEvent.UserData));
+                SceVideoOutInternalEventFlip,
+                OrbisKernelEventFilterVideoOut,
+                eventHint,
+                flipEvent.UserData);
         }
 
         TraceVideoOut($"videoout.submit_flip handle={handle} index={bufferIndex} mode={flipMode} arg={flipArg} events={flipEvents.Count}");

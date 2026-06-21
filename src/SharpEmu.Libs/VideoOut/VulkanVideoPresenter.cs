@@ -12,14 +12,17 @@ using VkSemaphore = Silk.NET.Vulkan.Semaphore;
 
 namespace SharpEmu.Libs.VideoOut;
 
+internal enum GuestDrawKind
+{
+    None,
+    FullscreenBarycentric,
+}
+
 internal static unsafe class VulkanVideoPresenter
 {
     private static readonly object _gate = new();
     private static Thread? _thread;
-    private static byte[]? _latestFrame;
-    private static uint _latestWidth;
-    private static uint _latestHeight;
-    private static long _latestSequence;
+    private static Presentation? _latestPresentation;
     private static bool _closed;
 
     public static void Submit(byte[] bgraFrame, uint width, uint height)
@@ -36,10 +39,42 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            _latestFrame = bgraFrame;
-            _latestWidth = width;
-            _latestHeight = height;
-            _latestSequence++;
+            var sequence = (_latestPresentation?.Sequence ?? 0) + 1;
+            _latestPresentation = new Presentation(bgraFrame, width, height, sequence, GuestDrawKind.None);
+            if (_thread is not null)
+            {
+                return;
+            }
+
+            _thread = new Thread(Run)
+            {
+                IsBackground = true,
+                Name = "SharpEmu Vulkan VideoOut",
+            };
+            _thread.Start();
+        }
+    }
+
+    public static void SubmitGuestDraw(GuestDrawKind drawKind, uint width, uint height)
+    {
+        if (drawKind == GuestDrawKind.None || width == 0 || height == 0)
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_closed ||
+                _latestPresentation is { Pixels: null } latest &&
+                latest.DrawKind == drawKind &&
+                latest.Width == width &&
+                latest.Height == height)
+            {
+                return;
+            }
+
+            var sequence = (_latestPresentation?.Sequence ?? 0) + 1;
+            _latestPresentation = new Presentation(null, width, height, sequence, drawKind);
             if (_thread is not null)
             {
                 return;
@@ -60,8 +95,8 @@ internal static unsafe class VulkanVideoPresenter
         uint height;
         lock (_gate)
         {
-            width = _latestWidth;
-            height = _latestHeight;
+            width = _latestPresentation?.Width ?? 1280;
+            height = _latestPresentation?.Height ?? 720;
         }
 
         try
@@ -83,25 +118,36 @@ internal static unsafe class VulkanVideoPresenter
         }
     }
 
-    private static bool TryTakeFrame(long presentedSequence, out Frame frame)
+    private static bool TryTakePresentation(long presentedSequence, out Presentation presentation)
     {
         lock (_gate)
         {
-            if (_latestFrame is null || _latestSequence == presentedSequence)
+            if (_latestPresentation is not { } latest || latest.Sequence == presentedSequence)
             {
-                frame = default;
+                presentation = default;
                 return false;
             }
 
-            frame = new Frame(_latestFrame, _latestWidth, _latestHeight, _latestSequence);
+            presentation = latest;
             return true;
         }
     }
 
-    private readonly record struct Frame(byte[] Pixels, uint Width, uint Height, long Sequence);
+    private readonly record struct Presentation(
+        byte[]? Pixels,
+        uint Width,
+        uint Height,
+        long Sequence,
+        GuestDrawKind DrawKind);
 
     private sealed class Presenter : IDisposable
     {
+        private const string FullscreenBarycentricVertexSpirv =
+            "AwIjBwAAAQALAAgAMgAAAAAAAAARAAIAAQAAAAsABgABAAAAR0xTTC5zdGQuNDUwAAAAAA4AAwAAAAAAAQAAAA8ACAAAAAAABAAAAG1haW4AAAAADQAAABoAAAApAAAAAwADAAIAAADCAQAABQAEAAQAAABtYWluAAAAAAUABgALAAAAZ2xfUGVyVmVydGV4AAAAAAYABgALAAAAAAAAAGdsX1Bvc2l0aW9uAAYABwALAAAAAQAAAGdsX1BvaW50U2l6ZQAAAAAGAAcACwAAAAIAAABnbF9DbGlwRGlzdGFuY2UABgAHAAsAAAADAAAAZ2xfQ3VsbERpc3RhbmNlAAUAAwANAAAAAAAAAAUABgAaAAAAZ2xfVmVydGV4SW5kZXgAAAUABQAdAAAAaW5kZXhhYmxlAAAABQAFACkAAABiYXJ5Y2VudHJpYwAFAAUALwAAAGluZGV4YWJsZQAAAEcAAwALAAAAAgAAAEgABQALAAAAAAAAAAsAAAAAAAAASAAFAAsAAAABAAAACwAAAAEAAABIAAUACwAAAAIAAAALAAAAAwAAAEgABQALAAAAAwAAAAsAAAAEAAAARwAEABoAAAALAAAAKgAAAEcABAApAAAAHgAAAAAAAAATAAIAAgAAACEAAwADAAAAAgAAABYAAwAGAAAAIAAAABcABAAHAAAABgAAAAQAAAAVAAQACAAAACAAAAAAAAAAKwAEAAgAAAAJAAAAAQAAABwABAAKAAAABgAAAAkAAAAeAAYACwAAAAcAAAAGAAAACgAAAAoAAAAgAAQADAAAAAMAAAALAAAAOwAEAAwAAAANAAAAAwAAABUABAAOAAAAIAAAAAEAAAArAAQADgAAAA8AAAAAAAAAFwAEABAAAAAGAAAAAgAAACsABAAIAAAAEQAAAAMAAAAcAAQAEgAAABAAAAARAAAAKwAEAAYAAAATAAAAAACAvywABQAQAAAAFAAAABMAAAATAAAAKwAEAAYAAAAVAAAAAABAQCwABQAQAAAAFgAAABUAAAATAAAALAAFABAAAAAXAAAAEwAAABUAAAAsAAYAEgAAABgAAAAUAAAAFgAAABcAAAAgAAQAGQAAAAEAAAAOAAAAOwAEABkAAAAaAAAAAQAAACAABAAcAAAABwAAABIAAAAgAAQAHgAAAAcAAAAQAAAAKwAEAAYAAAAhAAAAAAAAACsABAAGAAAAIgAAAAAAgD8gAAQAJgAAAAMAAAAHAAAAIAAEACgAAAADAAAAEAAAADsABAAoAAAAKQAAAAMAAAAsAAUAEAAAACoAAAAiAAAAIQAAACwABQAQAAAAKwAAACEAAAAiAAAALAAFABAAAAAsAAAAIQAAACEAAAAsAAYAEgAAAC0AAAAqAAAAKwAAACwAAAA2AAUAAgAAAAQAAAAAAAAAAwAAAPgAAgAFAAAAOwAEABwAAAAdAAAABwAAADsABAAcAAAALwAAAAcAAAA9AAQADgAAABsAAAAaAAAAPgADAB0AAAAYAAAAQQAFAB4AAAAfAAAAHQAAABsAAAA9AAQAEAAAACAAAAAfAAAAUQAFAAYAAAAjAAAAIAAAAAAAAABRAAUABgAAACQAAAAgAAAAAQAAAFAABwAHAAAAJQAAACMAAAAkAAAAIQAAACIAAABBAAUAJgAAACcAAAANAAAADwAAAD4AAwAnAAAAJQAAAD0ABAAOAAAALgAAABoAAAA+AAMALwAAAC0AAABBAAUAHgAAADAAAAAvAAAALgAAAD0ABAAQAAAAMQAAADAAAAA+AAMAKQAAADEAAAD9AAEAOAABAA==";
+
+        private const string FullscreenBarycentricFragmentSpirv =
+            "AwIjBwAAAQALAAgAEgAAAAAAAAARAAIAAQAAAAsABgABAAAAR0xTTC5zdGQuNDUwAAAAAA4AAwAAAAAAAQAAAA8ABwAEAAAABAAAAG1haW4AAAAACQAAAAwAAAAQAAMABAAAAAcAAAADAAMAAgAAAMIBAAAFAAQABAAAAG1haW4AAAAABQAFAAkAAABvdXRDb2xvcgAAAAAFAAUADAAAAGJhcnljZW50cmljAEcABAAJAAAAHgAAAAAAAABHAAQADAAAAB4AAAAAAAAAEwACAAIAAAAhAAMAAwAAAAIAAAAWAAMABgAAACAAAAAXAAQABwAAAAYAAAAEAAAAIAAEAAgAAAADAAAABwAAADsABAAIAAAACQAAAAMAAAAXAAQACgAAAAYAAAACAAAAIAAEAAsAAAABAAAACgAAADsABAALAAAADAAAAAEAAAArAAQABgAAAA4AAAAAAAAANgAFAAIAAAAEAAAAAAAAAAMAAAD4AAIABQAAAD0ABAAKAAAADQAAAAwAAABRAAUABgAAAA8AAAANAAAAAAAAAFEABQAGAAAAEAAAAA0AAAABAAAAUAAHAAcAAAARAAAADwAAABAAAAAOAAAADgAAAD4AAwAJAAAAEQAAAP0AAQA4AAEA";
+
         private readonly IWindow _window;
         private Vk _vk = null!;
         private KhrSurface _surfaceApi = null!;
@@ -114,9 +160,14 @@ internal static unsafe class VulkanVideoPresenter
         private uint _queueFamilyIndex;
         private SwapchainKHR _swapchain;
         private Image[] _swapchainImages = [];
+        private ImageView[] _swapchainImageViews = [];
+        private Framebuffer[] _framebuffers = [];
         private bool[] _imageInitialized = [];
         private Format _swapchainFormat;
         private Extent2D _extent;
+        private RenderPass _renderPass;
+        private PipelineLayout _pipelineLayout;
+        private Pipeline _barycentricPipeline;
         private CommandPool _commandPool;
         private CommandBuffer _commandBuffer;
         private VkSemaphore _imageAvailable;
@@ -127,12 +178,13 @@ internal static unsafe class VulkanVideoPresenter
         private long _presentedSequence;
         private bool _vulkanReady;
         private bool _firstFramePresented;
+        private bool _firstGuestDrawPresented;
 
         public Presenter(uint width, uint height)
         {
             var options = WindowOptions.DefaultVulkan;
             options.Size = new Vector2D<int>((int)width, (int)height);
-            options.Title = "SharpEmu VideoOut";
+            options.Title = VideoOutExports.GetWindowTitle();
             options.WindowBorder = WindowBorder.Fixed;
             options.VSync = true;
             _window = Window.Create(options);
@@ -158,6 +210,7 @@ internal static unsafe class VulkanVideoPresenter
             CreateDevice();
             CreateSwapchain();
             CreateCommandResources();
+            CreateGuestDrawResources();
             _vulkanReady = true;
             Console.Error.WriteLine(
                 $"[LOADER][INFO] Vulkan VideoOut ready: {_extent.Width}x{_extent.Height}, format={_swapchainFormat}");
@@ -323,7 +376,7 @@ internal static unsafe class VulkanVideoPresenter
                 ImageColorSpace = surfaceFormat.ColorSpace,
                 ImageExtent = _extent,
                 ImageArrayLayers = 1,
-                ImageUsage = ImageUsageFlags.TransferDstBit,
+                ImageUsage = ImageUsageFlags.TransferDstBit | ImageUsageFlags.ColorAttachmentBit,
                 ImageSharingMode = SharingMode.Exclusive,
                 PreTransform = capabilities.CurrentTransform,
                 CompositeAlpha = compositeAlpha,
@@ -377,6 +430,218 @@ internal static unsafe class VulkanVideoPresenter
             CreateStagingBuffer((ulong)_extent.Width * _extent.Height * 4);
         }
 
+        private void CreateGuestDrawResources()
+        {
+            var colorAttachment = new AttachmentDescription
+            {
+                Format = _swapchainFormat,
+                Samples = SampleCountFlags.Count1Bit,
+                LoadOp = AttachmentLoadOp.Clear,
+                StoreOp = AttachmentStoreOp.Store,
+                StencilLoadOp = AttachmentLoadOp.DontCare,
+                StencilStoreOp = AttachmentStoreOp.DontCare,
+                InitialLayout = ImageLayout.Undefined,
+                FinalLayout = ImageLayout.PresentSrcKhr,
+            };
+            var colorReference = new AttachmentReference
+            {
+                Attachment = 0,
+                Layout = ImageLayout.ColorAttachmentOptimal,
+            };
+            var subpass = new SubpassDescription
+            {
+                PipelineBindPoint = PipelineBindPoint.Graphics,
+                ColorAttachmentCount = 1,
+                PColorAttachments = &colorReference,
+            };
+            var dependency = new SubpassDependency
+            {
+                SrcSubpass = Vk.SubpassExternal,
+                DstSubpass = 0,
+                SrcStageMask = PipelineStageFlags.ColorAttachmentOutputBit,
+                DstStageMask = PipelineStageFlags.ColorAttachmentOutputBit,
+                DstAccessMask = AccessFlags.ColorAttachmentWriteBit,
+            };
+            var renderPassInfo = new RenderPassCreateInfo
+            {
+                SType = StructureType.RenderPassCreateInfo,
+                AttachmentCount = 1,
+                PAttachments = &colorAttachment,
+                SubpassCount = 1,
+                PSubpasses = &subpass,
+                DependencyCount = 1,
+                PDependencies = &dependency,
+            };
+            Check(_vk.CreateRenderPass(_device, &renderPassInfo, null, out _renderPass), "vkCreateRenderPass");
+
+            _swapchainImageViews = new ImageView[_swapchainImages.Length];
+            _framebuffers = new Framebuffer[_swapchainImages.Length];
+            for (var index = 0; index < _swapchainImages.Length; index++)
+            {
+                var viewInfo = new ImageViewCreateInfo
+                {
+                    SType = StructureType.ImageViewCreateInfo,
+                    Image = _swapchainImages[index],
+                    ViewType = ImageViewType.Type2D,
+                    Format = _swapchainFormat,
+                    Components = new ComponentMapping(
+                        ComponentSwizzle.Identity,
+                        ComponentSwizzle.Identity,
+                        ComponentSwizzle.Identity,
+                        ComponentSwizzle.Identity),
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                Check(
+                    _vk.CreateImageView(_device, &viewInfo, null, out _swapchainImageViews[index]),
+                    "vkCreateImageView");
+
+                var imageView = _swapchainImageViews[index];
+                var framebufferInfo = new FramebufferCreateInfo
+                {
+                    SType = StructureType.FramebufferCreateInfo,
+                    RenderPass = _renderPass,
+                    AttachmentCount = 1,
+                    PAttachments = &imageView,
+                    Width = _extent.Width,
+                    Height = _extent.Height,
+                    Layers = 1,
+                };
+                Check(
+                    _vk.CreateFramebuffer(_device, &framebufferInfo, null, out _framebuffers[index]),
+                    "vkCreateFramebuffer");
+            }
+
+            var layoutInfo = new PipelineLayoutCreateInfo
+            {
+                SType = StructureType.PipelineLayoutCreateInfo,
+            };
+            Check(
+                _vk.CreatePipelineLayout(_device, &layoutInfo, null, out _pipelineLayout),
+                "vkCreatePipelineLayout");
+            CreateBarycentricPipeline();
+        }
+
+        private void CreateBarycentricPipeline()
+        {
+            var vertexBytes = Convert.FromBase64String(FullscreenBarycentricVertexSpirv);
+            var fragmentBytes = Convert.FromBase64String(FullscreenBarycentricFragmentSpirv);
+            var vertexModule = CreateShaderModule(vertexBytes);
+            var fragmentModule = CreateShaderModule(fragmentBytes);
+            var entryPoint = (byte*)SilkMarshal.StringToPtr("main");
+            try
+            {
+                var shaderStages = stackalloc PipelineShaderStageCreateInfo[2];
+                shaderStages[0] = new PipelineShaderStageCreateInfo
+                {
+                    SType = StructureType.PipelineShaderStageCreateInfo,
+                    Stage = ShaderStageFlags.VertexBit,
+                    Module = vertexModule,
+                    PName = entryPoint,
+                };
+                shaderStages[1] = new PipelineShaderStageCreateInfo
+                {
+                    SType = StructureType.PipelineShaderStageCreateInfo,
+                    Stage = ShaderStageFlags.FragmentBit,
+                    Module = fragmentModule,
+                    PName = entryPoint,
+                };
+
+                var vertexInput = new PipelineVertexInputStateCreateInfo
+                {
+                    SType = StructureType.PipelineVertexInputStateCreateInfo,
+                };
+                var inputAssembly = new PipelineInputAssemblyStateCreateInfo
+                {
+                    SType = StructureType.PipelineInputAssemblyStateCreateInfo,
+                    Topology = PrimitiveTopology.TriangleList,
+                };
+                var viewport = new Viewport(0, 0, _extent.Width, _extent.Height, 0, 1);
+                var scissor = new Rect2D(new Offset2D(0, 0), _extent);
+                var viewportState = new PipelineViewportStateCreateInfo
+                {
+                    SType = StructureType.PipelineViewportStateCreateInfo,
+                    ViewportCount = 1,
+                    PViewports = &viewport,
+                    ScissorCount = 1,
+                    PScissors = &scissor,
+                };
+                var rasterization = new PipelineRasterizationStateCreateInfo
+                {
+                    SType = StructureType.PipelineRasterizationStateCreateInfo,
+                    PolygonMode = PolygonMode.Fill,
+                    CullMode = CullModeFlags.None,
+                    FrontFace = FrontFace.CounterClockwise,
+                    LineWidth = 1,
+                };
+                var multisample = new PipelineMultisampleStateCreateInfo
+                {
+                    SType = StructureType.PipelineMultisampleStateCreateInfo,
+                    RasterizationSamples = SampleCountFlags.Count1Bit,
+                };
+                var colorBlendAttachment = new PipelineColorBlendAttachmentState
+                {
+                    ColorWriteMask =
+                        ColorComponentFlags.RBit |
+                        ColorComponentFlags.GBit |
+                        ColorComponentFlags.BBit |
+                        ColorComponentFlags.ABit,
+                };
+                var colorBlend = new PipelineColorBlendStateCreateInfo
+                {
+                    SType = StructureType.PipelineColorBlendStateCreateInfo,
+                    AttachmentCount = 1,
+                    PAttachments = &colorBlendAttachment,
+                };
+                var pipelineInfo = new GraphicsPipelineCreateInfo
+                {
+                    SType = StructureType.GraphicsPipelineCreateInfo,
+                    StageCount = 2,
+                    PStages = shaderStages,
+                    PVertexInputState = &vertexInput,
+                    PInputAssemblyState = &inputAssembly,
+                    PViewportState = &viewportState,
+                    PRasterizationState = &rasterization,
+                    PMultisampleState = &multisample,
+                    PColorBlendState = &colorBlend,
+                    Layout = _pipelineLayout,
+                    RenderPass = _renderPass,
+                    Subpass = 0,
+                };
+                Check(
+                    _vk.CreateGraphicsPipelines(
+                        _device,
+                        default,
+                        1,
+                        &pipelineInfo,
+                        null,
+                        out _barycentricPipeline),
+                    "vkCreateGraphicsPipelines");
+            }
+            finally
+            {
+                SilkMarshal.Free((nint)entryPoint);
+                _vk.DestroyShaderModule(_device, fragmentModule, null);
+                _vk.DestroyShaderModule(_device, vertexModule, null);
+            }
+        }
+
+        private ShaderModule CreateShaderModule(byte[] code)
+        {
+            fixed (byte* codePointer = code)
+            {
+                var createInfo = new ShaderModuleCreateInfo
+                {
+                    SType = StructureType.ShaderModuleCreateInfo,
+                    CodeSize = (nuint)code.Length,
+                    PCode = (uint*)codePointer,
+                };
+                Check(
+                    _vk.CreateShaderModule(_device, &createInfo, null, out var module),
+                    "vkCreateShaderModule");
+                return module;
+            }
+        }
+
         private void CreateStagingBuffer(ulong size)
         {
             var bufferInfo = new BufferCreateInfo
@@ -420,17 +685,32 @@ internal static unsafe class VulkanVideoPresenter
 
         private void Render(double _)
         {
-            if (!_vulkanReady || !TryTakeFrame(_presentedSequence, out var frame))
+            if (!_vulkanReady || !TryTakePresentation(_presentedSequence, out var presentation))
             {
                 return;
             }
 
-            var pixels = frame.Width == _extent.Width && frame.Height == _extent.Height
-                ? frame.Pixels
-                : ScaleBgra(frame.Pixels, frame.Width, frame.Height, _extent.Width, _extent.Height);
-            if ((ulong)pixels.Length > _stagingSize)
+            if (presentation.Pixels is null &&
+                presentation.DrawKind != GuestDrawKind.FullscreenBarycentric)
             {
                 return;
+            }
+
+            byte[]? pixels = null;
+            if (presentation.Pixels is { } sourcePixels)
+            {
+                pixels = presentation.Width == _extent.Width && presentation.Height == _extent.Height
+                    ? sourcePixels
+                    : ScaleBgra(
+                        sourcePixels,
+                        presentation.Width,
+                        presentation.Height,
+                        _extent.Width,
+                        _extent.Height);
+                if ((ulong)pixels.Length > _stagingSize)
+                {
+                    return;
+                }
             }
 
             uint imageIndex;
@@ -444,15 +724,18 @@ internal static unsafe class VulkanVideoPresenter
                     &imageIndex),
                 "vkAcquireNextImageKHR");
 
-            void* mapped;
-            Check(
-                _vk.MapMemory(_device, _stagingMemory, 0, (ulong)pixels.Length, 0, &mapped),
-                "vkMapMemory");
-            fixed (byte* source = pixels)
+            if (pixels is not null)
             {
-                System.Buffer.MemoryCopy(source, mapped, pixels.Length, pixels.Length);
+                void* mapped;
+                Check(
+                    _vk.MapMemory(_device, _stagingMemory, 0, (ulong)pixels.Length, 0, &mapped),
+                    "vkMapMemory");
+                fixed (byte* source = pixels)
+                {
+                    System.Buffer.MemoryCopy(source, mapped, pixels.Length, pixels.Length);
+                }
+                _vk.UnmapMemory(_device, _stagingMemory);
             }
-            _vk.UnmapMemory(_device, _stagingMemory);
 
             Check(_vk.ResetCommandBuffer(_commandBuffer, 0), "vkResetCommandBuffer");
             var beginInfo = new CommandBufferBeginInfo
@@ -462,6 +745,93 @@ internal static unsafe class VulkanVideoPresenter
             };
             Check(_vk.BeginCommandBuffer(_commandBuffer, &beginInfo), "vkBeginCommandBuffer");
 
+            PipelineStageFlags waitStage;
+            if (pixels is not null)
+            {
+                RecordUpload(imageIndex);
+                waitStage = PipelineStageFlags.TransferBit;
+            }
+            else if (presentation.DrawKind == GuestDrawKind.FullscreenBarycentric)
+            {
+                var clearValue = default(ClearValue);
+                var renderPassInfo = new RenderPassBeginInfo
+                {
+                    SType = StructureType.RenderPassBeginInfo,
+                    RenderPass = _renderPass,
+                    Framebuffer = _framebuffers[imageIndex],
+                    RenderArea = new Rect2D(new Offset2D(0, 0), _extent),
+                    ClearValueCount = 1,
+                    PClearValues = &clearValue,
+                };
+                _vk.CmdBeginRenderPass(
+                    _commandBuffer,
+                    &renderPassInfo,
+                    SubpassContents.Inline);
+                _vk.CmdBindPipeline(
+                    _commandBuffer,
+                    PipelineBindPoint.Graphics,
+                    _barycentricPipeline);
+                _vk.CmdDraw(_commandBuffer, 3, 1, 0, 0);
+                _vk.CmdEndRenderPass(_commandBuffer);
+                waitStage = PipelineStageFlags.ColorAttachmentOutputBit;
+            }
+            else
+            {
+                throw new InvalidOperationException(
+                    $"Unsupported translated guest draw: {presentation.DrawKind}.");
+            }
+
+            Check(_vk.EndCommandBuffer(_commandBuffer), "vkEndCommandBuffer");
+
+            var imageAvailable = _imageAvailable;
+            var commandBuffer = _commandBuffer;
+            var renderFinished = _renderFinished;
+            var submitInfo = new SubmitInfo
+            {
+                SType = StructureType.SubmitInfo,
+                WaitSemaphoreCount = 1,
+                PWaitSemaphores = &imageAvailable,
+                PWaitDstStageMask = &waitStage,
+                CommandBufferCount = 1,
+                PCommandBuffers = &commandBuffer,
+                SignalSemaphoreCount = 1,
+                PSignalSemaphores = &renderFinished,
+            };
+            Check(_vk.QueueSubmit(_queue, 1, &submitInfo, default), "vkQueueSubmit");
+
+            var swapchain = _swapchain;
+            var presentInfo = new PresentInfoKHR
+            {
+                SType = StructureType.PresentInfoKhr,
+                WaitSemaphoreCount = 1,
+                PWaitSemaphores = &renderFinished,
+                SwapchainCount = 1,
+                PSwapchains = &swapchain,
+                PImageIndices = &imageIndex,
+            };
+            Check(_swapchainApi.QueuePresent(_queue, &presentInfo), "vkQueuePresentKHR");
+            Check(_vk.QueueWaitIdle(_queue), "vkQueueWaitIdle");
+            _imageInitialized[imageIndex] = true;
+            _presentedSequence = presentation.Sequence;
+            if (!_firstFramePresented)
+            {
+                _firstFramePresented = true;
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO] Vulkan VideoOut presented first frame: " +
+                    $"{presentation.Width}x{presentation.Height}");
+            }
+
+            if (pixels is null && !_firstGuestDrawPresented)
+            {
+                _firstGuestDrawPresented = true;
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO] Vulkan VideoOut presented translated guest draw: " +
+                    $"{presentation.DrawKind}");
+            }
+        }
+
+        private void RecordUpload(uint imageIndex)
+        {
             var oldLayout = _imageInitialized[imageIndex]
                 ? ImageLayout.PresentSrcKhr
                 : ImageLayout.Undefined;
@@ -479,7 +849,9 @@ internal static unsafe class VulkanVideoPresenter
             };
             _vk.CmdPipelineBarrier(
                 _commandBuffer,
-                _imageInitialized[imageIndex] ? PipelineStageFlags.BottomOfPipeBit : PipelineStageFlags.TopOfPipeBit,
+                _imageInitialized[imageIndex]
+                    ? PipelineStageFlags.BottomOfPipeBit
+                    : PipelineStageFlags.TopOfPipeBit,
                 PipelineStageFlags.TransferBit,
                 0,
                 0,
@@ -529,45 +901,6 @@ internal static unsafe class VulkanVideoPresenter
                 null,
                 1,
                 &toPresent);
-            Check(_vk.EndCommandBuffer(_commandBuffer), "vkEndCommandBuffer");
-
-            var waitStage = PipelineStageFlags.TransferBit;
-            var imageAvailable = _imageAvailable;
-            var commandBuffer = _commandBuffer;
-            var renderFinished = _renderFinished;
-            var submitInfo = new SubmitInfo
-            {
-                SType = StructureType.SubmitInfo,
-                WaitSemaphoreCount = 1,
-                PWaitSemaphores = &imageAvailable,
-                PWaitDstStageMask = &waitStage,
-                CommandBufferCount = 1,
-                PCommandBuffers = &commandBuffer,
-                SignalSemaphoreCount = 1,
-                PSignalSemaphores = &renderFinished,
-            };
-            Check(_vk.QueueSubmit(_queue, 1, &submitInfo, default), "vkQueueSubmit");
-
-            var swapchain = _swapchain;
-            var presentInfo = new PresentInfoKHR
-            {
-                SType = StructureType.PresentInfoKhr,
-                WaitSemaphoreCount = 1,
-                PWaitSemaphores = &renderFinished,
-                SwapchainCount = 1,
-                PSwapchains = &swapchain,
-                PImageIndices = &imageIndex,
-            };
-            Check(_swapchainApi.QueuePresent(_queue, &presentInfo), "vkQueuePresentKHR");
-            Check(_vk.QueueWaitIdle(_queue), "vkQueueWaitIdle");
-            _imageInitialized[imageIndex] = true;
-            _presentedSequence = frame.Sequence;
-            if (!_firstFramePresented)
-            {
-                _firstFramePresented = true;
-                Console.Error.WriteLine(
-                    $"[LOADER][INFO] Vulkan VideoOut presented first guest frame: {frame.Width}x{frame.Height}");
-            }
         }
 
         private Extent2D ChooseExtent(SurfaceCapabilitiesKHR capabilities)
@@ -668,6 +1001,32 @@ internal static unsafe class VulkanVideoPresenter
             if (_renderFinished.Handle != 0)
             {
                 _vk.DestroySemaphore(_device, _renderFinished, null);
+            }
+            if (_barycentricPipeline.Handle != 0)
+            {
+                _vk.DestroyPipeline(_device, _barycentricPipeline, null);
+            }
+            if (_pipelineLayout.Handle != 0)
+            {
+                _vk.DestroyPipelineLayout(_device, _pipelineLayout, null);
+            }
+            foreach (var framebuffer in _framebuffers)
+            {
+                if (framebuffer.Handle != 0)
+                {
+                    _vk.DestroyFramebuffer(_device, framebuffer, null);
+                }
+            }
+            if (_renderPass.Handle != 0)
+            {
+                _vk.DestroyRenderPass(_device, _renderPass, null);
+            }
+            foreach (var imageView in _swapchainImageViews)
+            {
+                if (imageView.Handle != 0)
+                {
+                    _vk.DestroyImageView(_device, imageView, null);
+                }
             }
             if (_commandPool.Handle != 0)
             {
