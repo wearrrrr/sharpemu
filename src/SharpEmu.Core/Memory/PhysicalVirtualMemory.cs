@@ -9,7 +9,7 @@ namespace SharpEmu.Core.Memory;
 
 public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryAllocator, IDisposable
 {
-    private readonly object _gate = new();
+    private readonly ReaderWriterLockSlim _gate = new(LockRecursionPolicy.SupportsRecursion);
     private readonly object _guestAllocationGate = new();
     private readonly List<MemoryRegion> _regions = new();
     private readonly Dictionary<ulong, ProgramHeaderFlags> _pageProtections = new();
@@ -78,7 +78,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             return false;
         }
 
-        lock (_gate)
+        _gate.EnterWriteLock();
+        try
         {
             _regions.Add(new MemoryRegion
             {
@@ -88,6 +89,10 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 IsReservedOnly = false,
                 Protection = protection
             });
+        }
+        finally
+        {
+            _gate.ExitWriteLock();
         }
 
         var allocationKind = executable ? "executable memory" : "data memory";
@@ -202,7 +207,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             }
         }
 
-        lock (_gate)
+        _gate.EnterWriteLock();
+        try
         {
             _regions.Add(new MemoryRegion
             {
@@ -212,6 +218,10 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 IsReservedOnly = reservedOnly,
                 Protection = protection
             });
+        }
+        finally
+        {
+            _gate.ExitWriteLock();
         }
 
         var allocationKind = reservedOnly
@@ -315,7 +325,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     {
         lock (_guestAllocationGate)
         {
-            lock (_gate)
+            _gate.EnterWriteLock();
+            try
             {
                 foreach (var region in _regions)
                 {
@@ -323,6 +334,10 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 }
                 _regions.Clear();
                 _pageProtections.Clear();
+            }
+            finally
+            {
+                _gate.ExitWriteLock();
             }
 
             _guestAllocationArenaBase = 0;
@@ -343,7 +358,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         var mapEnd = AlignUp(segmentEnd, PageSize);
         var mapSize = checked(mapEnd - mapStart);
 
-        lock (_gate)
+        _gate.EnterWriteLock();
+        try
         {
             var existingRegion = FindRegion(mapStart, mapSize);
             if (existingRegion == null)
@@ -375,6 +391,10 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             ApplySegmentProtection(mapStart, mapEnd, protection);
 
             Console.Error.WriteLine($"[VMEM] Mapped segment: 0x{virtualAddress:X16} - 0x{virtualAddress + memorySize:X16} (file: {fileData.Length} bytes, prot: {protection})");
+        }
+        finally
+        {
+            _gate.ExitWriteLock();
         }
     }
 
@@ -425,7 +445,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     public IReadOnlyList<VirtualMemoryRegion> SnapshotRegions()
     {
-        lock (_gate)
+        _gate.EnterReadLock();
+        try
         {
             var snapshot = new VirtualMemoryRegion[_regions.Count];
             for (var i = 0; i < _regions.Count; i++)
@@ -440,11 +461,17 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             }
             return snapshot;
         }
+        finally
+        {
+            _gate.ExitReadLock();
+        }
     }
 
     public bool TryRead(ulong virtualAddress, Span<byte> destination)
     {
-        lock (_gate)
+        var requiresExclusiveAccess = false;
+        _gate.EnterReadLock();
+        try
         {
             foreach (var region in _regions)
             {
@@ -456,48 +483,55 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                         return true;
                     }
 
-                    if (!EnsureRangeCommitted((ulong)srcPtr, (ulong)destination.Length, region))
+                    if (region.IsReservedOnly)
                     {
-                        return false;
-                    }
-
-                    if (CanReadWithoutProtectionChange((ulong)srcPtr, (ulong)destination.Length, region))
-                    {
-                        fixed (byte* destPtr = destination)
+                        if (!EnsureRangeCommitted((ulong)srcPtr, (ulong)destination.Length, region))
                         {
-                            Buffer.MemoryCopy(srcPtr, destPtr, (nuint)destination.Length, (nuint)destination.Length);
-                        }
-
-                        return true;
-                    }
-
-                    if (!TryTemporarilyProtectForRead((ulong)srcPtr, (ulong)destination.Length, region, out var touchedPages))
-                    {
-                        return false;
-                    }
-
-                    try
-                    {
-                        fixed (byte* destPtr = destination)
-                        {
-                            Buffer.MemoryCopy(srcPtr, destPtr, (nuint)destination.Length, (nuint)destination.Length);
+                            return false;
                         }
                     }
-                    finally
+
+                    if (!CanReadWithoutProtectionChange((ulong)srcPtr, (ulong)destination.Length, region))
                     {
-                        RestorePageProtections(touchedPages);
+                        requiresExclusiveAccess = true;
+                        break;
+                    }
+
+                    fixed (byte* destPtr = destination)
+                    {
+                        Buffer.MemoryCopy(srcPtr, destPtr, (nuint)destination.Length, (nuint)destination.Length);
                     }
 
                     return true;
                 }
             }
+        }
+        finally
+        {
+            _gate.ExitReadLock();
+        }
+
+        if (!requiresExclusiveAccess)
+        {
             return false;
+        }
+
+        _gate.EnterWriteLock();
+        try
+        {
+            return TryReadExclusive(virtualAddress, destination);
+        }
+        finally
+        {
+            _gate.ExitWriteLock();
         }
     }
 
     public bool TryWrite(ulong virtualAddress, ReadOnlySpan<byte> source)
     {
-        lock (_gate)
+        var requiresExclusiveAccess = false;
+        _gate.EnterReadLock();
+        try
         {
             foreach (var region in _regions)
             {
@@ -509,47 +543,148 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                         return true;
                     }
 
-                    if (!EnsureRangeCommitted((ulong)destPtr, (ulong)source.Length, region))
+                    if (region.IsReservedOnly)
                     {
-                        return false;
-                    }
-
-                    if (CanWriteWithoutProtectionChange((ulong)destPtr, (ulong)source.Length, region))
-                    {
-                        fixed (byte* srcPtr = source)
+                        if (!EnsureRangeCommitted((ulong)destPtr, (ulong)source.Length, region))
                         {
-                            Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
-                        }
-
-                        return true;
-                    }
-
-                    if (!VirtualProtect(destPtr, (nuint)source.Length, PAGE_EXECUTE_READWRITE, out var oldProtect))
-                    {
-                        return false;
-                    }
-
-                    try
-                    {
-                        fixed (byte* srcPtr = source)
-                        {
-                            Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                            return false;
                         }
                     }
-                    finally
+
+                    if (!CanWriteWithoutProtectionChange((ulong)destPtr, (ulong)source.Length, region))
                     {
-                        VirtualProtect(destPtr, (nuint)source.Length, oldProtect, out _);
-                        if (IsExecutableProtection(oldProtect))
-                        {
-                            FlushInstructionCache(null, destPtr, (nuint)source.Length);
-                        }
+                        requiresExclusiveAccess = true;
+                        break;
+                    }
+
+                    fixed (byte* srcPtr = source)
+                    {
+                        Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
                     }
 
                     return true;
                 }
             }
+        }
+        finally
+        {
+            _gate.ExitReadLock();
+        }
+
+        if (!requiresExclusiveAccess)
+        {
             return false;
         }
+
+        _gate.EnterWriteLock();
+        try
+        {
+            return TryWriteExclusive(virtualAddress, source);
+        }
+        finally
+        {
+            _gate.ExitWriteLock();
+        }
+    }
+
+    private bool TryReadExclusive(ulong virtualAddress, Span<byte> destination)
+    {
+        foreach (var region in _regions)
+        {
+            if (!TryResolveRegionOffset(virtualAddress, (ulong)destination.Length, region, out var offset))
+            {
+                continue;
+            }
+
+            var srcPtr = (void*)(region.VirtualAddress + offset);
+            if (!EnsureRangeCommitted((ulong)srcPtr, (ulong)destination.Length, region))
+            {
+                return false;
+            }
+
+            if (CanReadWithoutProtectionChange((ulong)srcPtr, (ulong)destination.Length, region))
+            {
+                fixed (byte* destPtr = destination)
+                {
+                    Buffer.MemoryCopy(srcPtr, destPtr, (nuint)destination.Length, (nuint)destination.Length);
+                }
+
+                return true;
+            }
+
+            if (!TryTemporarilyProtectForRead((ulong)srcPtr, (ulong)destination.Length, region, out var touchedPages))
+            {
+                return false;
+            }
+
+            try
+            {
+                fixed (byte* destPtr = destination)
+                {
+                    Buffer.MemoryCopy(srcPtr, destPtr, (nuint)destination.Length, (nuint)destination.Length);
+                }
+            }
+            finally
+            {
+                RestorePageProtections(touchedPages);
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool TryWriteExclusive(ulong virtualAddress, ReadOnlySpan<byte> source)
+    {
+        foreach (var region in _regions)
+        {
+            if (!TryResolveRegionOffset(virtualAddress, (ulong)source.Length, region, out var offset))
+            {
+                continue;
+            }
+
+            var destPtr = (void*)(region.VirtualAddress + offset);
+            if (!EnsureRangeCommitted((ulong)destPtr, (ulong)source.Length, region))
+            {
+                return false;
+            }
+
+            if (CanWriteWithoutProtectionChange((ulong)destPtr, (ulong)source.Length, region))
+            {
+                fixed (byte* srcPtr = source)
+                {
+                    Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                }
+
+                return true;
+            }
+
+            if (!VirtualProtect(destPtr, (nuint)source.Length, PAGE_EXECUTE_READWRITE, out var oldProtect))
+            {
+                return false;
+            }
+
+            try
+            {
+                fixed (byte* srcPtr = source)
+                {
+                    Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                }
+            }
+            finally
+            {
+                VirtualProtect(destPtr, (nuint)source.Length, oldProtect, out _);
+                if (IsExecutableProtection(oldProtect))
+                {
+                    FlushInstructionCache(null, destPtr, (nuint)source.Length);
+                }
+            }
+
+            return true;
+        }
+
+        return false;
     }
 
     public bool TryWriteUInt64(ulong virtualAddress, ulong value)
@@ -561,7 +696,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     public void* GetPointer(ulong virtualAddress)
     {
-        lock (_gate)
+        _gate.EnterReadLock();
+        try
         {
             foreach (var region in _regions)
             {
@@ -573,11 +709,16 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             }
             return null;
         }
+        finally
+        {
+            _gate.ExitReadLock();
+        }
     }
 
     public bool IsAccessible(ulong virtualAddress, ulong size)
     {
-        lock (_gate)
+        _gate.EnterReadLock();
+        try
         {
             foreach (var region in _regions)
             {
@@ -587,6 +728,10 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 }
             }
             return false;
+        }
+        finally
+        {
+            _gate.ExitReadLock();
         }
     }
 
@@ -611,7 +756,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         }
 
         var end = address + size;
-        lock (_gate)
+        _gate.EnterReadLock();
+        try
         {
             foreach (var region in _regions)
             {
@@ -621,6 +767,10 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     overlapEnd = Math.Max(overlapEnd, regionEnd);
                 }
             }
+        }
+        finally
+        {
+            _gate.ExitReadLock();
         }
 
         return overlapEnd != 0;
@@ -707,15 +857,26 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         var endPage = AlignUp(address + size, PageSize);
         var commitProtection = GetCommitProtection(region);
 
-        for (var pageAddress = startPage; pageAddress < endPage; pageAddress += PageSize)
+        var pageAddress = startPage;
+        while (pageAddress < endPage)
         {
             if (VirtualQuery((void*)pageAddress, out var info, (nuint)sizeof(MemoryBasicInformation64)) == 0)
             {
                 return false;
             }
 
+            var queriedEnd = info.RegionSize > ulong.MaxValue - info.BaseAddress
+                ? ulong.MaxValue
+                : info.BaseAddress + info.RegionSize;
+            var rangeEnd = Math.Min(endPage, queriedEnd);
+            if (rangeEnd <= pageAddress)
+            {
+                return false;
+            }
+
             if (info.State == MEM_COMMIT)
             {
+                pageAddress = rangeEnd;
                 continue;
             }
 
@@ -724,10 +885,13 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 return false;
             }
 
-            if (VirtualAlloc((void*)pageAddress, (nuint)PageSize, MEM_COMMIT, commitProtection) == null)
+            var commitSize = rangeEnd - pageAddress;
+            if (VirtualAlloc((void*)pageAddress, (nuint)commitSize, MEM_COMMIT, commitProtection) == null)
             {
                 return false;
             }
+
+            pageAddress = rangeEnd;
         }
 
         return true;
